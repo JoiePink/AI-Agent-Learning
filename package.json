@@ -12,7 +12,8 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "openai": "^6.49.0",
-    "undici": "^7.29.0"
+    "undici": "^7.29.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

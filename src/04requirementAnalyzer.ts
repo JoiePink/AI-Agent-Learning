@@ -1,92 +1,40 @@
 import "dotenv/config";
 import OpenAI from "openai";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
+import { z } from "zod";
+import { zodTextFormat } from "openai/helpers/zod.js";
 
 if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is not defined in the environment variables.");
+  throw new Error(
+    "OPENAI_API_KEY is not defined in the environment variables.",
+  );
 }
 
-setGlobalDispatcher(
-    new ProxyAgent("http://127.0.0.1:7897")
-)
+setGlobalDispatcher(new ProxyAgent("http://127.0.0.1:7897"));
 
 const client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    baseURL: "https://aihub.top/v1",
-})
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: "https://aihub.top/v1",
+});
 
 // 联合类型，表示任务类型只能是三者之一
-type TaskType = "frontend" | "backend" | "test"
+const TaskTypeSchema = z.enum(["frontend", "backend", "test"]);
 
-// 定义“一条开发任务”应该有什么字段
-type RequirementTask = {
-    title: string;
-    type: TaskType;
-    description: string;
-    acceptanceCriteria: string[];
-}
+const RequirementTaskSchema = z.object({
+  title: z.string(),
+  type: TaskTypeSchema,
+  description: z.string(),
+  acceptanceCriteria: z.array(z.string()).min(1),
+});
 
-// 定义一次完整的需求分析结果
-type RequirementResult = {
-    // 需求摘要
-    summary: string;
-    // 需求中没有说清楚的信息
-    missingInformation: string[];
-    // 需要完成的开发任务
-    tasks: RequirementTask[];
-    // 可能的风险
-    risks: string[];
-}
+const RequirementResultSchema = z.object({
+  summary: z.string(),
+  missingInformation: z.array(z.string()),
+  tasks: z.array(RequirementTaskSchema),
+  risks: z.array(z.string()),
+});
 
-function isStringArray(value: unknown): value is string[] {
-    return (
-        Array.isArray(value) && value.every((item) => typeof item === 'string')
-    )
-}
-
-const allowedTaskTypes: TaskType[] = [
-    "frontend",
-    "backend",
-    "test"
-]
-
-function isRequirementTask(value: unknown): value is RequirementTask {
-    if (typeof value !== 'object' || value === null) {
-        return false;
-    }
-
-    // Record<string, unknown>表示这是一个拥有字符串属性名的对象，但我们还不知道每个属性的类型
-    const task = value as Record<string, unknown>;
-
-    return (
-        typeof task.title === 'string' &&
-        typeof task.type === 'string' &&
-        allowedTaskTypes.includes(task.type as TaskType) &&
-        typeof task.description === 'string' &&
-        isStringArray(task.acceptanceCriteria) &&
-        // 至少有一条验收标准
-        task.acceptanceCriteria.length > 0
-    )
-}
-
-function isRequirementResult(value: unknown): value is RequirementResult {
-    if (typeof value !== 'object' || value === null) {
-        return false;
-    }
-
-    const result = value as Record<string, unknown>;
-
-    return (
-        typeof result.summary === 'string' &&
-        isStringArray(result.missingInformation) &&
-        Array.isArray(result.tasks) &&
-        // tasks 数组中的每一项，都必须通过 isRequirementTask() 校验
-        result.tasks.every(isRequirementTask) &&
-        Array.isArray(result.risks) &&
-        result.risks.every((item) => typeof item === 'string')
-    )
-}
-
+type RequirementResult = z.infer<typeof RequirementResultSchema>;
 
 // 告诉模型应该怎么工作
 const instructions = `
@@ -103,45 +51,56 @@ const instructions = `
 6. risks：列出需求可能涉及的安全、成本、兼容性或业务风险。
 7. 不要编造需求中没有提供的接口地址、字段名称和业务规则。
 8. 如果信息不明确，把它放入 missingInformation，不要自己猜测。
-9. 只返回合法 JSON，不要返回 Markdown 代码块或额外解释。
 `;
 
-// 告诉模型这次要分析什么
-const requirement: string = `
-小程序新增手机号验证码登录功能。
+async function analyzeRequirement(
+  requirement: string,
+): Promise<RequirementResult> {
+  const response = await client.responses.parse({
+    model: "gpt-5.6-luna",
+    // 负责“内容应该怎么分析”
+    instructions,
+    input: requirement,
+    // 负责“结果必须长什么样”
+    text: {
+      format: zodTextFormat(RequirementResultSchema, "requirement_analysis"),
+    },
+  });
 
-用户输入手机号后可以获取验证码，填写验证码并点击登录。
-登录成功后进入首页，登录失败时显示错误提示。
-`;
+  // 响应不完整 incomplete
+  if (response.status === "incomplete") {
+    const reason = response.incomplete_details?.reason;
 
-async function analyzeRequirement(requirement: string): Promise<RequirementResult> {
-    const response = await client.responses.create({
-        model: 'gpt-5.6-luna',
-        instructions,
-        input: requirement,
-    })
-
-    const rawText = response.output_text.trim();
-
-    let parsed: unknown;
-
-    try {
-        parsed = JSON.parse(rawText);
-    } catch (error) {
-        console.error("模型返回的原始内容")
-        console.error(rawText)
-        throw new Error("模型返回的内容不是合法的 JSON。");
+    if (reason === "max_output_tokens") {
+      throw new Error("模型输出达到长度限制，响应未完成");
     }
 
-    if (!isRequirementResult(parsed)) {
-
-        console.error("模型返回的原始内容")
-        console.error(rawText)
-
-        throw new Error("模型返回的 JSON 不符合 RequirementResult 类型要求。");
+    if (reason === "content_filter") {
+      throw new Error("模型输出因内容过滤而中断");
     }
 
-    return parsed;
+    throw new Error("模型响应未完成，原因未知");
+  }
+
+  for (const output of response.output) {
+    if (output.type !== "message") {
+      continue;
+    }
+
+    // 模型拒绝 refusal
+    for (const content of output.content) {
+      if (content.type === "refusal") {
+        throw new Error(`模型拒绝处理该需求：${content.refusal}`);
+      }
+    }
+  }
+
+  const parsed = response.output_parsed;
+  if (!parsed) {
+    throw new Error("模型没有返回可解析的结构化结果");
+  }
+
+  return parsed;
 }
 
 async function main() {
@@ -176,15 +135,10 @@ async function main() {
     console.log("原始需求：", testCase.requirement.trim());
     console.log("正在分析，请稍候……");
 
-    const result = await analyzeRequirement(
-      testCase.requirement,
-    );
+    const result = await analyzeRequirement(testCase.requirement);
 
     console.log("\n分析摘要：", result.summary);
-    console.log(
-      "缺失信息数量：",
-      result.missingInformation.length,
-    );
+    console.log("缺失信息数量：", result.missingInformation.length);
     console.log("开发任务数量：", result.tasks.length);
     console.log("风险数量：", result.risks.length);
 
